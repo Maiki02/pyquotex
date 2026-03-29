@@ -1,11 +1,33 @@
 """Module for Quotex websocket."""
 import json
+import os
 import time
 import logging
+from pathlib import Path
 import websocket
 from .. import global_value
 
 logger = logging.getLogger(__name__)
+
+
+def _is_debug_dump_enabled() -> bool:
+    return os.getenv("PYQUOTEX_DEBUG_DUMP_BYTES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_debug_dump_dir() -> Path:
+    configured_dir = os.getenv("PYQUOTEX_DEBUG_DUMP_DIR", "").strip()
+    if configured_dir:
+        return Path(configured_dir)
+    return Path.cwd() / "pyquotex_ws_dumps"
+
+
+def _dump_raw_ws_bytes(payload: bytes) -> None:
+    dump_dir = _get_debug_dump_dir()
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    file_name = f"ws_message_{int(time.time() * 1000)}.bin"
+    dump_path = dump_dir / file_name
+    with dump_path.open("ab") as dump_file:
+        dump_file.write(payload)
 
 
 class WebsocketClient(object):
@@ -40,6 +62,15 @@ class WebsocketClient(object):
     def on_message(self, wss, msg):
         """Method to process websocket messages."""
         global_value.ssl_Mutual_exclusion = True
+        debug_dump_enabled = _is_debug_dump_enabled()
+        message = msg
+        if debug_dump_enabled:
+            print(type(message))
+            if isinstance(message, (bytes, bytearray)):
+                try:
+                    _dump_raw_ws_bytes(bytes(message))
+                except Exception as dump_error:
+                    logger.debug("Unable to dump raw websocket bytes: %s", dump_error)
         current_time = time.localtime()
         if current_time.tm_sec in [0, 5, 10, 15, 20, 30, 40, 50]:
             self.wss.send('42["tick"]')
