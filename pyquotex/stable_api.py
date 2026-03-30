@@ -122,7 +122,7 @@ class Quotex:
             pass
 
     async def get_instruments(self):
-        while self.check_connect and self.api.instruments is None:
+        while await self.check_connect() and self.api.instruments is None:
             await asyncio.sleep(0.2)
         return self.api.instruments or []
 
@@ -164,8 +164,15 @@ class Quotex:
         self.api.candles.candles_data = None
         self.start_candles_stream(asset, period)
         self.api.get_candles(asset, index, end_from_time, offset, period)
+        started_at = time.time()
+        timeout_seconds = 60
         while True:
-            while self.check_connect and self.api.candles.candles_data is None:
+            while await self.check_connect() and self.api.candles.candles_data is None:
+                if time.time() - started_at >= timeout_seconds:
+                    logger.warning("Timeout waiting candles for asset=%s period=%s", asset, period)
+                    if progressive and isinstance(self.api.historical_candles, dict):
+                        return self.api.historical_candles.get("data", {})
+                    return []
                 await asyncio.sleep(0.1)
             if self.api.candles.candles_data is not None:
                 break
@@ -185,8 +192,13 @@ class Quotex:
         self.api.historical_candles = None
         self.start_candles_stream(asset)
         self.api.get_history_line(self.codes_asset[asset], index, end_from_time, offset)
+        started_at = time.time()
+        timeout_seconds = 60
         while True:
-            while self.check_connect and self.api.historical_candles is None:
+            while await self.check_connect() and self.api.historical_candles is None:
+                if time.time() - started_at >= timeout_seconds:
+                    logger.warning("Timeout waiting history line for asset=%s", asset)
+                    return {}
                 await asyncio.sleep(0.2)
             if self.api.historical_candles is not None:
                 break
