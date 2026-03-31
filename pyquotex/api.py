@@ -55,27 +55,6 @@ def nested_dict(n, type):
 class QuotexAPI(object):
     """Class for communication with Quotex API."""
 
-    socket_option_opened = {}
-    buy_id = None
-    pending_id = None
-    trace_ws = False
-    buy_expiration = None
-    current_asset = None
-    current_period = None
-    buy_successful = None
-    pending_successful = None
-    account_balance = None
-    account_type = None
-    instruments = None
-    training_balance_edit_request = None
-    profit_in_operation = None
-    sold_options_respond = None
-    sold_digital_options_respond = None
-    listinfodata = ListInfoData()
-    timesync = TimeSync()
-    candles = Candles()
-    profile = Profile()
-
     def __init__(
         self,
         host,
@@ -111,6 +90,30 @@ class QuotexAPI(object):
         self.user_data_dir = user_data_dir
         self.proxies = proxies
         self.lang = lang
+        self.state = global_value.create_connection_state()
+
+        # Mutable state must be instance-scoped to avoid data bleeding across clients.
+        self.socket_option_opened = {}
+        self.buy_id = None
+        self.pending_id = None
+        self.trace_ws = False
+        self.buy_expiration = None
+        self.current_asset = None
+        self.current_period = None
+        self.buy_successful = None
+        self.pending_successful = None
+        self.account_balance = None
+        self.account_type = None
+        self.instruments = None
+        self.training_balance_edit_request = None
+        self.profit_in_operation = None
+        self.sold_options_respond = None
+        self.sold_digital_options_respond = None
+        self.listinfodata = ListInfoData()
+        self.timesync = TimeSync()
+        self.candles = Candles()
+        self.profile = Profile()
+
         self.settings_list = {}
         self.signal_data = {}
         self.get_candle_data = {}
@@ -409,13 +412,13 @@ class QuotexAPI(object):
         :param str data: The websocket request data.
         :param bool no_force_send: Default None.
         """
-        while global_value.ssl_Mutual_exclusion or global_value.ssl_Mutual_exclusion_write and no_force_send:
+        while (self.state.ssl_mutual_exclusion or self.state.ssl_mutual_exclusion_write) and no_force_send:
             pass
-        
-        global_value.ssl_Mutual_exclusion_write = True
+
+        self.state.ssl_mutual_exclusion_write = True
         self.websocket.send(data)
         logger.debug(data)
-        global_value.ssl_Mutual_exclusion_write = False
+        self.state.ssl_mutual_exclusion_write = False
 
     async def authenticate(self) -> Tuple[bool, str]:
         print("Connecting User Account ...")
@@ -425,16 +428,16 @@ class QuotexAPI(object):
             status, msg = await login(self.username, self.password, self.user_data_dir)
 
         if status:
-            global_value.SSID = self.session_data.get("token")
+            self.state.ssid = self.session_data.get("token")
             self.is_logged = True
 
         return status, msg
 
     async def start_websocket(self):
-        global_value.check_websocket_if_connect = None
-        global_value.check_websocket_if_error = False
-        global_value.websocket_error_reason = None
-        if not global_value.SSID:
+        self.state.check_websocket_if_connect = None
+        self.state.check_websocket_if_error = False
+        self.state.websocket_error_reason = None
+        if not self.state.ssid:
             await self.authenticate()
         self.websocket_client = WebsocketClient(self)
         payload = {
@@ -460,25 +463,25 @@ class QuotexAPI(object):
         self.websocket_thread.daemon = True
         self.websocket_thread.start()
         while True:
-            if global_value.check_websocket_if_error:
-                return False, global_value.websocket_error_reason
-            elif global_value.check_websocket_if_connect == 0:
+            if self.state.check_websocket_if_error:
+                return False, self.state.websocket_error_reason
+            elif self.state.check_websocket_if_connect == 0:
                 logger.debug("Websocket connection closed.")
                 return False, "Websocket connection closed."
-            elif global_value.check_websocket_if_connect == 1:
+            elif self.state.check_websocket_if_connect == 1:
                 logger.debug("Websocket connected successfully!!!")
                 return True, "Websocket connected successfully!!!"
-            elif global_value.check_rejected_connection == 1:
-                global_value.SSID = None
+            elif self.state.check_rejected_connection == 1:
+                self.state.ssid = None
                 logger.debug("Websocket Token Rejected.")
                 return True, "Websocket Token Rejected."
 
     def send_ssid(self, timeout=10):
         self.wss_message = None
-        if not global_value.SSID:
+        if not self.state.ssid:
             return False
 
-        self.ssid(global_value.SSID)
+        self.ssid(self.state.ssid)
         start_time = time.time()
 
         while self.wss_message is None:
@@ -491,9 +494,9 @@ class QuotexAPI(object):
     async def connect(self, is_demo):
         """Method for connection to Quotex API."""
         self.account_type = is_demo
-        global_value.ssl_Mutual_exclusion = False
-        global_value.ssl_Mutual_exclusion_write = False
-        if global_value.check_websocket_if_connect:
+        self.state.ssl_mutual_exclusion = False
+        self.state.ssl_mutual_exclusion_write = False
+        if self.state.check_websocket_if_connect:
             logger.info("Closing websocket connection...")
             await self.close()
 

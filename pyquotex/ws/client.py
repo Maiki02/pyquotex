@@ -5,7 +5,6 @@ import time
 import logging
 from pathlib import Path
 import websocket
-from .. import global_value
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +60,7 @@ class WebsocketClient(object):
 
     def on_message(self, wss, msg):
         """Method to process websocket messages."""
-        global_value.ssl_Mutual_exclusion = True
+        self.api.state.ssl_mutual_exclusion = True
         debug_dump_enabled = _is_debug_dump_enabled()
         message = msg
         if debug_dump_enabled:
@@ -78,12 +77,12 @@ class WebsocketClient(object):
             if "authorization/reject" in str(msg):
                 print("Token rejected, making automatic reconnection.")
                 logger.debug("Token rejected, making automatic reconnection.")
-                global_value.check_rejected_connection = 1
+                self.api.state.check_rejected_connection = 1
             elif "s_authorization" in str(msg):
-                global_value.check_accepted_connection = 1
-                global_value.check_rejected_connection = 0
+                self.api.state.check_accepted_connection = 1
+                self.api.state.check_rejected_connection = 0
             elif "instruments/list" in str(msg):
-                global_value.started_listen_instruments = True
+                self.api.state.started_listen_instruments = True
 
             try:
                 message = msg[1:].decode()
@@ -137,9 +136,9 @@ class WebsocketClient(object):
                     elif message.get("isDemo") and message.get("balance"):
                         self.api.training_balance_edit_request = message
                     elif message.get("error"):
-                        global_value.websocket_error_reason = message.get("error")
-                        global_value.check_websocket_if_error = True
-                        if global_value.websocket_error_reason == "not_money":
+                        self.api.state.websocket_error_reason = message.get("error")
+                        self.api.state.check_websocket_if_error = True
+                        if self.api.state.websocket_error_reason == "not_money":
                             self.api.account_balance = {"liveBalance": 0}
                     elif not message.get("list") == []:
                         self.api.wss_message = message
@@ -148,17 +147,19 @@ class WebsocketClient(object):
 
             if str(message) == "41":
                 logger.info("Disconnection event triggered by the platform, causing automatic reconnection.")
-                global_value.check_websocket_if_connect = 0
+                self.api.state.check_websocket_if_connect = 0
             if "51-" in str(message):
                 self.api._temp_status = str(message)
             elif self.api._temp_status == """451-["settings/list",{"_placeholder":true,"num":0}]""":
                 self.api.settings_list = message
                 self.api._temp_status = ""
             elif self.api._temp_status == """451-["history/list/v2",{"_placeholder":true,"num":0}]""":
-                if message.get("asset") == self.api.current_asset:
+                message_asset = message.get("asset")
+                if message_asset:
+                    self.api.current_asset = message_asset
                     self.api.candles.candles_data = message["history"]
-                    self.api.candle_v2_data[message["asset"]] = message
-                    self.api.candle_v2_data[message["asset"]]["candles"] = [{
+                    self.api.candle_v2_data[message_asset] = message
+                    self.api.candle_v2_data[message_asset]["candles"] = [{
                         "time": candle[0],
                         "open": candle[1],
                         "close": candle[2],
@@ -167,12 +168,15 @@ class WebsocketClient(object):
                         "ticks": candle[5]
                     } for candle in message["candles"]]
             elif len(message[0]) == 4:
-                result = {
-                    "time": message[0][1],
-                    "price": message[0][2]
-                }
-                self.api.realtime_price[message[0][0]].append(result)
-                self.api.realtime_candles[self.api.current_asset] = message[0]
+                payload_asset = message[0][0] if isinstance(message[0][0], str) else self.api.current_asset
+                if payload_asset:
+                    result = {
+                        "time": message[0][1],
+                        "price": message[0][2]
+                    }
+                    self.api.realtime_price.setdefault(payload_asset, []).append(result)
+                    self.api.realtime_candles[payload_asset] = message[0]
+                    self.api.current_asset = payload_asset
                 #print(self.api.realtime_candles)
             elif len(message[0]) == 2:
                 for i in message:
@@ -185,18 +189,18 @@ class WebsocketClient(object):
                     self.api.realtime_sentiment[i[0]] = result
         except:
             pass
-        global_value.ssl_Mutual_exclusion = False
+        self.api.state.ssl_mutual_exclusion = False
 
     def on_error(self, wss, error):
         """Method to process websocket errors."""
         logger.error(error)
-        global_value.websocket_error_reason = str(error)
-        global_value.check_websocket_if_error = True
+        self.api.state.websocket_error_reason = str(error)
+        self.api.state.check_websocket_if_error = True
 
     def on_open(self, wss):
         """Method to process websocket open."""
         logger.info("Websocket client connected.")
-        global_value.check_websocket_if_connect = 1
+        self.api.state.check_websocket_if_connect = 1
         asset_name = self.api.current_asset
         period = self.api.current_period
         self.wss.send('42["tick"]')
@@ -211,7 +215,7 @@ class WebsocketClient(object):
     def on_close(self, wss, close_status_code, close_msg):
         """Method to process websocket close."""
         logger.info("Websocket connection closed.")
-        global_value.check_websocket_if_connect = 0
+        self.api.state.check_websocket_if_connect = 0
 
     def on_ping(self, wss, ping_msg):
         pass

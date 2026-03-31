@@ -4,7 +4,6 @@ import asyncio
 from datetime import datetime
 from typing import Dict
 from . import expiration
-from . import global_value
 from .api import QuotexAPI
 from .utils.services import truncate
 from .utils.processor import (
@@ -87,10 +86,9 @@ class Quotex:
         """
         return self.websocket_client.wss
 
-    @staticmethod
-    async def check_connect():
+    async def check_connect(self):
         await asyncio.sleep(2)
-        if global_value.check_accepted_connection == 1:
+        if self.api and self.api.state.check_accepted_connection == 1:
             return True
 
         return False
@@ -245,7 +243,7 @@ class Quotex:
         self.api.session_data = self.session_data
         self.api.current_asset = self.asset_default
         self.api.current_period = self.period_default
-        global_value.SSID = self.session_data.get("token")
+        self.api.state.ssid = self.session_data.get("token")
 
         if not self.session_data.get("token"):
             check, reason = await self.api.authenticate()
@@ -647,8 +645,8 @@ class Quotex:
                 status_buy = False
                 break
             await asyncio.sleep(0.2)
-            if global_value.check_websocket_if_error:
-                return False, global_value.websocket_error_reason
+            if self.api.state.check_websocket_if_error:
+                return False, self.api.state.websocket_error_reason
         else:
             status_buy = True
 
@@ -672,8 +670,8 @@ class Quotex:
                 status_buy = False
                 break
             await asyncio.sleep(0.2)
-            if global_value.check_websocket_if_error:
-                return False, global_value.websocket_error_reason
+            if self.api.state.check_websocket_if_error:
+                return False, self.api.state.websocket_error_reason
         else:
             status_buy = True
             self.api.instruments_follow(amount, asset, direction, duration, open_time)

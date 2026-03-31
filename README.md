@@ -91,6 +91,49 @@ print(await client.get_balance())
 await client.close()
 ```
 
+## 🔀 Multi sessão no mesmo processo (2 instrumentos)
+
+Agora o estado de conexão/WebSocket é isolado por instância de cliente. Isso permite executar duas sessões no mesmo processo sem compartilhar flags de conexão.
+
+```python
+import asyncio
+import time
+from pyquotex.stable_api import Quotex
+
+
+async def watch_symbol(email, password, symbol, period=60):
+  client = Quotex(email=email, password=password, lang="en")
+  ok, reason = await client.connect()
+  if not ok:
+    print(symbol, "connect error:", reason)
+    return
+
+  asset_name, asset_data = await client.get_available_asset(symbol, force_open=True)
+  if not asset_data or not asset_data[2]:
+    print(symbol, "asset unavailable")
+    await client.close()
+    return
+
+  candles = await client.get_candles(asset_name, time.time(), 3600, period)
+  print(symbol, "candles:", len(candles))
+  await client.close()
+
+
+async def main():
+  await asyncio.gather(
+    watch_symbol("user_1@email.com", "pass_1", "AUDJPY_otc"),
+    watch_symbol("user_2@email.com", "pass_2", "EURUSD_otc"),
+  )
+
+
+asyncio.run(main())
+```
+
+Boas práticas:
+- Uma instância de `Quotex` por sessão.
+- Não reutilizar o mesmo objeto para múltiplos logins concorrentes.
+- Fechar cada sessão com `await client.close()`.
+
 ---
 
 ## 💡 Recursos Principais
