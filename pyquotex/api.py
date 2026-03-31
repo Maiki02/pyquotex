@@ -1,19 +1,15 @@
 """Module for Quotex websocket."""
-
 import os
-import sys
 import time
 import json
 import ssl
 import asyncio
 from typing import Tuple
-import urllib3
-import requests
 import certifi
 import logging
 import platform
 import threading
-from . import global_value
+from .global_value import ConnectionState
 from .http.login import Login
 from .http.logout import Logout
 from .http.settings import Settings
@@ -30,13 +26,12 @@ from .ws.objects.listinfodata import ListInfoData
 from .ws.client import WebsocketClient
 from collections import defaultdict
 
-urllib3.disable_warnings()
 logger = logging.getLogger(__name__)
 
 cert_path = certifi.where()
-os.environ["SSL_CERT_FILE"] = cert_path
-os.environ["WEBSOCKET_CLIENT_CA_BUNDLE"] = cert_path
-cacert = os.environ.get("WEBSOCKET_CLIENT_CA_BUNDLE")
+os.environ['SSL_CERT_FILE'] = cert_path
+os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = cert_path
+cacert = os.environ.get('WEBSOCKET_CLIENT_CA_BUNDLE')
 
 ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ssl_context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2
@@ -52,18 +47,18 @@ def nested_dict(n, type):
         return defaultdict(lambda: nested_dict(n - 1, type))
 
 
-class QuotexAPI(object):
+class QuotexAPI:
     """Class for communication with Quotex API."""
 
     def __init__(
-        self,
-        host,
-        username,
-        password,
-        lang,
-        proxies=None,
-        resource_path=None,
-        user_data_dir=".",
+            self,
+            host,
+            username,
+            password,
+            lang,
+            proxies=None,
+            resource_path=None,
+            user_data_dir="."
     ):
         """
         :param str host: The hostname or ip address of a Quotex server.
@@ -73,6 +68,31 @@ class QuotexAPI(object):
         :param proxies: The proxies of a Quotex server.
         :param user_data_dir: The path browser user data dir.
         """
+        # -- per-instance connection state (replaces global_value) --
+        self.state = ConnectionState()
+
+        # -- per-instance mutable attributes (were class-level before) --
+        self.socket_option_opened = {}
+        self.buy_id = None
+        self.pending_id = None
+        self.trace_ws = False
+        self.buy_expiration = None
+        self.current_asset = None
+        self.current_period = None
+        self.buy_successful = None
+        self.pending_successful = None
+        self.account_balance = None
+        self.account_type = None
+        self.instruments = None
+        self.training_balance_edit_request = None
+        self.profit_in_operation = None
+        self.sold_options_respond = None
+        self.sold_digital_options_respond = None
+        self.listinfodata = ListInfoData()
+        self.timesync = TimeSync()
+        self.candles = Candles()
+        self.profile = Profile()
+
         self.host = host
         self.https_url = f"https://{host}"
         self.wss_url = f"wss://ws2.{host}/socket.io/?EIO=3&transport=websocket"
@@ -140,12 +160,18 @@ class QuotexAPI(object):
     def subscribe_realtime_candle(self, asset, period):
         self.realtime_price[asset] = []
         self.realtime_candles[asset] = {}
-        payload = {"asset": asset, "period": period}
+        payload = {
+            "asset": asset,
+            "period": period
+        }
         data = f'42["instruments/update", {json.dumps(payload)}]'
         return self.send_websocket_request(data)
 
     def chart_notification(self, asset):
-        payload = {"asset": asset, "version": "1.0.0"}
+        payload = {
+            "asset": asset,
+            "version": "1.0.0"
+        }
         data = f'42["chart_notification/get", {json.dumps(payload)}]'
         return self.send_websocket_request(data)
 
@@ -158,14 +184,14 @@ class QuotexAPI(object):
         return self.send_websocket_request(data)
 
     def settings_apply(
-        self,
-        asset,
-        duration,
-        is_fast_option=False,
-        end_time=None,
-        deal=5,
-        percent_mode=False,
-        percent_deal=1,
+            self,
+            asset,
+            duration,
+            is_fast_option=False,
+            end_time=None,
+            deal=5,
+            percent_mode=False,
+            percent_deal=1
     ):
         payload = {
             "chartId": "graph",
@@ -205,12 +231,15 @@ class QuotexAPI(object):
         self.send_websocket_request(data)
 
     def signals_subscribe(self):
-        data = f'42["signal/subscribe"]'
+        data = '42["signal/subscribe"]'
         self.send_websocket_request(data)
 
     def change_account(self, account_type):
         self.account_type = account_type
-        payload = {"demo": self.account_type, "tournamentId": 0}
+        payload = {
+            "demo": self.account_type,
+            "tournamentId": 0
+        }
         data = f'42["account/change",{json.dumps(payload)}]'
         self.send_websocket_request(data)
 
@@ -234,12 +263,17 @@ class QuotexAPI(object):
             "amount": amount,
         }
         data = f'42["pending/create",{json.dumps(payload)}]'
-        print(data)
-        # 42["pending/create",{"openType":0,"asset":"AUDCAD_otc","openTime":"2025-04-01T20:09:00.000Z","timeframe":60,"command":"call","amount":50}]
-        # 42["pending/create",{"openType":0,"asset":"EURUSD_otc","openTime":"2025-04-01T20:11:00.000Z","timeframe":60,"command":"call","amount":5}]
+        logger.debug(data)
         self.send_websocket_request(data)
 
-    def instruments_follow(self, amount, asset, direction, duration, open_time):
+    def instruments_follow(
+            self,
+            amount,
+            asset,
+            direction,
+            duration,
+            open_time
+    ):
         payload = {
             "amount": amount,
             "command": 0 if direction == "call" else 1,
@@ -256,32 +290,12 @@ class QuotexAPI(object):
         self.send_websocket_request(data)
 
     def indicators(self):
-        # 42["indicator/store",{"requestId":"X0edg3KVvtrbiTpm9kTpR","chartId":"graph","type":"zz","settings":{"lines":{"main":{"lineWidth":2,"color":"#D13939"}},"deviation":5,"depth":12,"backstep":3},"visible":1}]
-        # 451-["s_indicator/store",{"_placeholder":true,"num":0}]
-        # {"requestId":"X0edg3KVvtrbiTpm9kTpR","id":"367ae671-7619-4f5e-96de-5d4ebd2ca7dc"}
-
-        # 42["settings/store",{"chartId":"graph","settings":{"chartId":"graph","chartType":2,"currentExpirationTime":1734459660,"isFastOption":false,"isFastAmountOption":false,"isIndicatorsMinimized":false,"isIndicatorsShowing":true,"isShortBetElement":false,"chartPeriod":4,"currentAsset":{"symbol":"EURUSD"},"dealValue":5,"dealPercentValue":1,"isVisible":true,"timePeriod":60,"gridOpacity":8,"isAutoScrolling":1,"isOneClickTrade":true,"upColor":"#0FAF59","downColor":"#FF6251"}}]
-
-        # 42["indicator/change",{"id":"X0edg3KVvtrbiTpm9kTpR","settings":{"lines":{"main":{"lineWidth":2,"color":"#D13939"}},"deviation":5,"depth":12,"backstep":3}}]
-
-        # 42["indicator/change",{"id":"Y5zYtYaUtjI6eUz06YlGF","settings":{"lines":{"main":{"lineWidth":1,"color":"#db4635"}},"ma":"SMA","period":10}}]
-        # 42["indicator/delete",{"id":"23507dc2-05ca-4aec-9aef-55939735b3e0"}]
-        # 42["indicator/delete",{"id":"367ae671-7619-4f5e-96de-5d4ebd2ca7dc"}]
-
-        # 42["indicator/store",{"requestId":"p_rQlJmbrY3ZNWyC8_jAh","chartId":"graph","type":"ma","settings":{"lines":{"main":{"lineWidth":1,"color":"#db4635"}},"ma":"SMA","period":10},"visible":1}]
-        # 42["settings/store",{"chartId":"graph","settings":{"chartId":"graph","chartType":2,"currentExpirationTime":1734460020,"isFastOption":false,"isFastAmountOption":false,"isIndicatorsMinimized":false,"isIndicatorsShowing":true,"isShortBetElement":false,"chartPeriod":4,"currentAsset":{"symbol":"EURUSD"},"dealValue":5,"dealPercentValue":1,"isVisible":true,"timePeriod":60,"gridOpacity":8,"isAutoScrolling":1,"isOneClickTrade":true,"upColor":"#0FAF59","downColor":"#FF6251"}}]
-        # 42["indicator/change",{"id":"p_rQlJmbrY3ZNWyC8_jAh","settings":{"lines":{"main":{"lineWidth":1,"color":"#db4635"}},"ma":"SMA","period":10}}]
-        # 42["indicator/change",{"id":"48d765c8-32ef-496e-84d7-981774adc771","settings":{"lines":{"main":{"lineWidth":1,"color":"#db4635"}},"ma":"WMA","period":10}}]
-        # 42["indicator/change",{"id":"48d765c8-32ef-496e-84d7-981774adc771","settings":{"lines":{"main":{"lineWidth":1,"color":"#db4635"}},"ma":"EMA","period":10}}]
-        # 42["indicator/change",{"id":"48d765c8-32ef-496e-84d7-981774adc771","settings":{"lines":{"main":{"lineWidth":1,"color":"#db4635"}},"ma":"SMMA","period":10}}]
-        # 42["indicator/change",{"id":"48d765c8-32ef-496e-84d7-981774adc771","settings":{"lines":{"main":{"lineWidth":1,"color":"#db4635"}},"ma":"TMA","period":10}}]
-        # 42["indicator/change",{"id":"48d765c8-32ef-496e-84d7-981774adc771","settings":{"lines":{"main":{"lineWidth":1,"color":"#db4635"}},"ma":"SMA","period":10}}]
         pass
 
     @property
     def logout(self):
         """Property for get Quotex http login resource.
-        :returns: The instance of :class:`Login
+        :returns: The instance of: class:`Login
             <pyquotex.http.login.Login>`.
         """
         return Logout(self)
@@ -289,7 +303,7 @@ class QuotexAPI(object):
     @property
     def login(self):
         """Property for get Quotex http login resource.
-        :returns: The instance of :class:`Login
+        :returns: The instance of: class:`Login
             <pyquotex.http.login.Login>`.
         """
         return Login(self)
@@ -327,13 +341,18 @@ class QuotexAPI(object):
     def get_history(self):
         """Property for get Quotex http get history.
 
-        :returns: The instance of :class:`GetHistory
+        :returns: The instance of: class:`GetHistory
             <pyquotex.http.history.GetHistory>`.
         """
         return GetHistory(self)
 
     def send_http_request_v1(
-        self, resource, method, data=None, params=None, headers=None
+            self,
+            resource,
+            method,
+            data=None,
+            params=None,
+            headers=None
     ):
         """Send http request to Quotex server.
 
@@ -343,8 +362,10 @@ class QuotexAPI(object):
         :param dict data: (optional) The http request data.
         :param dict params: (optional) The http request params.
         :param dict headers: (optional) The http request headers.
-        :returns: The instance of :class:`Response <requests.Response>`.
+        :returns: The instance of: class:`Response <requests.Response>`.
         """
+        import requests
+
         url = resource.url
         logger.debug(url)
         cookies = self.session_data.get("cookies")
@@ -372,7 +393,11 @@ class QuotexAPI(object):
         self.browser.headers["Sec-Fetch-Mode"] = "navigate"
         self.browser.headers["Dnt"] = "1"
         response = self.browser.send_request(
-            method=method, url=url, data=data, params=params
+            method=method,
+            url=url,
+            data=data,
+            params=params,
+            proxies=self.proxies
         )
         try:
             response.raise_for_status()
@@ -409,26 +434,30 @@ class QuotexAPI(object):
 
     def send_websocket_request(self, data, no_force_send=True):
         """Send websocket request to Quotex server.
-        :param str data: The websocket request data.
+        :param str data: The websocket requests data.
         :param bool no_force_send: Default None.
         """
-        while (self.state.ssl_mutual_exclusion or self.state.ssl_mutual_exclusion_write) and no_force_send:
+        while (self.state.ssl_Mutual_exclusion
+               or self.state.ssl_Mutual_exclusion_write) and no_force_send:
             pass
-
-        self.state.ssl_mutual_exclusion_write = True
+        self.state.ssl_Mutual_exclusion_write = True
         self.websocket.send(data)
         logger.debug(data)
-        self.state.ssl_mutual_exclusion_write = False
+        self.state.ssl_Mutual_exclusion_write = False
 
     async def authenticate(self) -> Tuple[bool, str]:
-        print("Connecting User Account ...")
+        logger.info("Connecting User Account ...")
         logger.debug("Login Account User...")
         async with self.login as login:
-            if self.proxies: login.proxies = self.proxies
-            status, msg = await login(self.username, self.password, self.user_data_dir)
+            status, msg = await login(
+                self.username,
+                self.password,
+                self.user_data_dir
+            )
+            logger.info(msg)
 
         if status:
-            self.state.ssid = self.session_data.get("token")
+            self.state.SSID = self.session_data.get("token")
             self.is_logged = True
 
         return status, msg
@@ -437,23 +466,22 @@ class QuotexAPI(object):
         self.state.check_websocket_if_connect = None
         self.state.check_websocket_if_error = False
         self.state.websocket_error_reason = None
-        if not self.state.ssid:
+        if not self.state.SSID:
             await self.authenticate()
         self.websocket_client = WebsocketClient(self)
         payload = {
-            "suppress_origin": True,  # CloudFlare handshake status 403 forbidden fix
+            "suppress_origin": True,
             "ping_interval": 24,
             "ping_timeout": 20,
             "ping_payload": "2",
             "origin": self.https_url,
             "host": f"ws2.{self.host}",
             "sslopt": {
-                "check_hostname": False,
-                "cert_reqs": ssl.CERT_NONE,
+                "check_hostname": True,
+                "cert_reqs": ssl.CERT_REQUIRED,
                 "ca_certs": cacert,
                 "context": ssl_context,
-            },
-            "reconnect": 5,
+            }
         }
         if platform.system() == "Linux":
             payload["sslopt"]["ssl_version"] = ssl.PROTOCOL_TLS
@@ -472,30 +500,32 @@ class QuotexAPI(object):
                 logger.debug("Websocket connected successfully!!!")
                 return True, "Websocket connected successfully!!!"
             elif self.state.check_rejected_connection == 1:
-                self.state.ssid = None
+                self.state.SSID = None
                 logger.debug("Websocket Token Rejected.")
                 return True, "Websocket Token Rejected."
+            
+            await asyncio.sleep(0.1)
 
-    def send_ssid(self, timeout=10):
+    async def send_ssid(self, timeout=10):
         self.wss_message = None
-        if not self.state.ssid:
+        if not self.state.SSID:
             return False
 
-        self.ssid(self.state.ssid)
+        self.ssid(self.state.SSID)
         start_time = time.time()
 
         while self.wss_message is None:
             if time.time() - start_time > timeout:
                 return False
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
 
         return True
 
     async def connect(self, is_demo):
         """Method for connection to Quotex API."""
         self.account_type = is_demo
-        self.state.ssl_mutual_exclusion = False
-        self.state.ssl_mutual_exclusion_write = False
+        self.state.ssl_Mutual_exclusion = False
+        self.state.ssl_Mutual_exclusion_write = False
         if self.state.check_websocket_if_connect:
             logger.info("Closing websocket connection...")
             await self.close()
@@ -504,12 +534,12 @@ class QuotexAPI(object):
 
         if not check_websocket:
             return check_websocket, websocket_reason
-        check_ssid = self.send_ssid()
+        check_ssid = await self.send_ssid()
 
         if not check_ssid:
             await self.authenticate()
             if self.is_logged:
-                self.send_ssid()
+                await self.send_ssid()
 
         return check_websocket, websocket_reason
 
