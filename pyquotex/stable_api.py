@@ -96,10 +96,7 @@ class Quotex:
     @staticmethod
     async def _check_connect(state):
         """Check connection using the per-instance state object."""
-        await asyncio.sleep(2)
-        if state.check_accepted_connection == 1:
-            return True
-        return False
+        return state.check_accepted_connection == 1
 
     async def check_connect(self):
         """Check connection using the current API's state."""
@@ -186,29 +183,42 @@ class Quotex:
     async def get_candles(self, asset, end_from_time, offset, period, progressive=False, timeout=DEFAULT_TIMEOUT):
         if end_from_time is None:
             end_from_time = time.time()
+
         index = expiration.get_timestamp()
         # Clear only this asset's entry — not the entire candles object.
         self.api.candles.clear(asset)
-        # Do NOT open a realtime stream for a static historical fetch.
-        # Only subscribe when the caller explicitly requests progressive
-        # (live candle-building) mode; the caller is then responsible for
-        # calling stop_candles_stream(asset) when done.
+
+        # Mandatory trigger for history/list/v2 on Quotex.
+        # Without this minimal subscription, the broker may never send
+        # candle history for this asset and the polling loop times out.
+        self.api.subscribe_realtime_candle(asset, period)
+
         if progressive:
-            self.start_candles_stream(asset, period)
+            # In progressive mode we keep realtime side-channels enabled.
+            self.api.chart_notification(asset)
+            self.api.follow_candle(asset)
+
         self.api.get_candles(asset, index, end_from_time, offset, period)
-        start_time = time.time()
-        while await self.check_connect() and self.api.candles.get(asset) is None:
-            if time.time() - start_time > timeout:
-                logger.error(f"Timeout waiting for get_candles data for {asset}.")
-                return None
-            await asyncio.sleep(0.1)
 
-        candles = self.prepare_candles(asset, period)
+        try:
+            start_time = time.time()
+            while await self.check_connect() and self.api.candles.get(asset) is None:
+                if time.time() - start_time > timeout:
+                    logger.error(f"Timeout waiting for get_candles data for {asset}.")
+                    return None
+                await asyncio.sleep(0.1)
 
-        if progressive:
-            return self.api.historical_candles.get(asset, {})
+            candles = self.prepare_candles(asset, period)
 
-        return candles
+            if progressive:
+                return self.api.historical_candles.get(asset, {})
+
+            return candles
+        finally:
+            # Snapshot mode must teardown the minimal subscription to avoid
+            # leaking network bandwidth and memory over time.
+            if not progressive:
+                self.api.unsubscribe_realtime_candle(asset)
 
     async def get_history_line(self, asset, end_from_time, offset, timeout=DEFAULT_TIMEOUT):
         if end_from_time is None:
@@ -293,10 +303,29 @@ class Quotex:
                 return check, reason
 
         check, reason = await self.api.connect(self.account_is_demo)
+
+        # If the WebSocket rejected the token (expired session), fall back to
+        # fresh HTTP authentication and reconnect with the new token.
         if not await self.check_connect():
-            logger.error("Websocket failed to connect or connection was rejected.")
+            logger.warning(
+                "Token de sesion rechazado o vencido. "
+                "Ejecutando fallback de login con credenciales..."
+            )
+
+            # Discard the stale session so authenticate() creates a new one.
             self.session_data = {}
-            return False, "Websocket connection rejected."
+
+            check_auth, reason_auth = await self.api.authenticate()
+            if not check_auth:
+                logger.error("Fallo en el fallback de autenticacion: %s", reason_auth)
+                return False, f"Re-autenticacion fallida: {reason_auth}"
+
+            # Retry the WebSocket connection with the freshly obtained token.
+            check, reason = await self.api.connect(self.account_is_demo)
+
+            if not await self.check_connect():
+                logger.error("Websocket rechazado incluso tras renovar credenciales.")
+                return False, "Websocket connection rejected after re-auth."
 
         return check, reason
 
