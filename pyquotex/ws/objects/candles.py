@@ -115,38 +115,48 @@ class Candles(Base):
     # kept for backward compatibility only).
     # ------------------------------------------------------------------
 
-    def _last_data(self):
-        """Return data for the most recently updated asset, or None."""
-        if not self.__candles_data:
-            return None
-        return next(reversed(self.__candles_data.values()), None)
+    # ------------------------------------------------------------------
+    # Legacy positional accessors — REMOVED for concurrent safety.
+    #
+    # first_candle / second_candle / current_candle previously relied on
+    # _last_data(), which returned whichever asset happened to have been
+    # updated last in the dict.  In a multi-asset environment this is
+    # non-deterministic: a GBPUSD tick arriving a millisecond before you
+    # call current_candle will silently return GBPUSD data even if you
+    # expected EURUSD.
+    #
+    # Use Candles.get(asset) directly and index the list yourself:
+    #
+    #   data = self.api.candles.get("EURUSD")
+    #   if data:
+    #       open_price  = data[0][1]
+    #       close_price = data[0][2]
+    # ------------------------------------------------------------------
+
+    def _last_data(self):  # pragma: no cover
+        raise NotImplementedError(
+            "_last_data() is unsafe in a multi-asset context and has been removed. "
+            "Use Candles.get(asset) to retrieve data for a specific asset."
+        )
 
     @property
-    def first_candle(self):
-        """Method to get first candle of the last updated asset.
-
-        :returns: The instance of :class:`Candle
-            <pyquotex.ws.objects.candles.Candle>`.
-        """
-        data = self._last_data()
-        return Candle(data[0]) if data else None
+    def first_candle(self):  # pragma: no cover
+        raise NotImplementedError(
+            "first_candle is unsafe in a multi-asset context: it returned data for "
+            "whichever asset was updated last, which is non-deterministic under "
+            "concurrent subscriptions. Use candles.get(asset)[0] instead."
+        )
 
     @property
-    def second_candle(self):
-        """Method to get second candle of the last updated asset.
-
-        :returns: The instance of :class:`Candle
-            <pyquotex.ws.objects.candles.Candle>`.
-        """
-        data = self._last_data()
-        return Candle(data[1]) if data else None
+    def second_candle(self):  # pragma: no cover
+        raise NotImplementedError(
+            "second_candle is unsafe in a multi-asset context. "
+            "Use candles.get(asset)[1] instead."
+        )
 
     @property
-    def current_candle(self):
-        """Method to get current candle of the last updated asset.
-
-        :returns: The instance of :class:`Candle
-            <pyquotex.ws.objects.candles.Candle>`.
-        """
-        data = self._last_data()
-        return Candle(data[-1]) if data else None
+    def current_candle(self):  # pragma: no cover
+        raise NotImplementedError(
+            "current_candle is unsafe in a multi-asset context. "
+            "Use candles.get(asset)[-1] instead."
+        )

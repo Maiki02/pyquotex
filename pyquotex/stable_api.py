@@ -42,6 +42,7 @@ class Quotex:
             period_default: int = 60,
             proxies: Dict[str, str] = None
     ):
+        self._trade_lock = asyncio.Lock()
         self.size = [
             5,
             10,
@@ -159,7 +160,17 @@ class Quotex:
         instruments = await self.get_instruments()
         for i in instruments:
             if asset_name == i[1]:
-                self.api.current_asset = asset_name
+                # Validate index bounds before accessing positional fields.
+                # Quotex may change the instrument schema; a missing field
+                # must not silently corrupt state or raise an unhandled IndexError.
+                if len(i) <= 14:
+                    logger.warning(
+                        "Instrument entry for '%s' has only %d fields (expected >14). "
+                        "Schema may have changed.", asset_name, len(i)
+                    )
+                    return i, (i[0], i[2].replace("\n", "") if len(i) > 2 else asset_name, None)
+                # current_asset is NOT updated here — it is informational-only
+                # and must not be used as a routing key anywhere in the codebase.
                 return i, (i[0], i[2].replace("\n", ""), i[14])
 
         return [None, [None, None, None]]
@@ -178,7 +189,12 @@ class Quotex:
         index = expiration.get_timestamp()
         # Clear only this asset's entry — not the entire candles object.
         self.api.candles.clear(asset)
-        self.start_candles_stream(asset, period)
+        # Do NOT open a realtime stream for a static historical fetch.
+        # Only subscribe when the caller explicitly requests progressive
+        # (live candle-building) mode; the caller is then responsible for
+        # calling stop_candles_stream(asset) when done.
+        if progressive:
+            self.start_candles_stream(asset, period)
         self.api.get_candles(asset, index, end_from_time, offset, period)
         start_time = time.time()
         while await self.check_connect() and self.api.candles.get(asset) is None:
@@ -200,8 +216,11 @@ class Quotex:
         index = expiration.get_timestamp()
         # Reset only this asset's entry — never the whole dict.
         self.api.historical_candles[asset] = None
-        self.start_candles_stream(asset)
-        # Pass asset= so api.get_history_line registers the Correlation ID.
+        # history/load/line is a self-contained request-response over the
+        # existing WebSocket connection — it does NOT require an open
+        # realtime subscription. Opening one here would leak bandwidth by
+        # leaving instruments/update and depth/follow streams alive after
+        # the method returns.
         self.api.get_history_line(self.codes_asset[asset], index, end_from_time, offset, asset=asset)
         start_time = time.time()
         while await self.check_connect() and self.api.historical_candles.get(asset) is None:
@@ -213,15 +232,26 @@ class Quotex:
 
     async def get_candle_v2(self, asset, period, timeout=DEFAULT_TIMEOUT):
         self.api.candle_v2_data[asset] = None
-        self.start_candles_stream(asset, period)
-        start_time = time.time()
-        while self.api.candle_v2_data[asset] is None:
-            if time.time() - start_time > timeout:
-                logger.error(f"Timeout waiting for get_candle_v2 data for {asset}.")
-                return None
-            await asyncio.sleep(0.2)
-        candles = self.prepare_candles(asset, period)
-        return candles
+        # Trigger the server's history/list/v2 response via the minimal
+        # instruments/update subscription. We deliberately avoid the full
+        # start_candles_stream() because chart_notification() and
+        # follow_candle() open additional persistent real-time streams that
+        # are not needed for a one-off historical snapshot.
+        # The try/finally guarantees teardown even on timeout or exception.
+        self.api.subscribe_realtime_candle(asset, period)
+        try:
+            start_time = time.time()
+            while self.api.candle_v2_data[asset] is None:
+                if time.time() - start_time > timeout:
+                    logger.error(f"Timeout waiting for get_candle_v2 data for {asset}.")
+                    return None
+                await asyncio.sleep(0.2)
+            candles = self.prepare_candles(asset, period)
+            return candles
+        finally:
+            # Always unsubscribe: avoid leaving a real-time feed open that
+            # was only needed to fetch a historical snapshot.
+            self.api.unsubscribe_realtime_candle(asset)
 
     def prepare_candles(self, asset: str, period: int):
         """
@@ -616,66 +646,68 @@ class Quotex:
         # Snapshot current keys so we can detect the new operation ID
         # returned by the server, even when multiple buy() calls run
         # concurrently (they each see a different initial_keys set).
-        initial_keys = set(self.api.buy_id.keys())
-        request_id = expiration.get_timestamp()
-        is_fast_option = time_mode.upper() == "TIME"
-        self.start_candles_stream(asset, duration)
-        await self.get_server_time()
-        self.api.buy(amount, asset, direction, duration, request_id, is_fast_option)
+        async with self._trade_lock:
+            initial_keys = set(self.api.buy_id.keys())
+            request_id = expiration.get_timestamp()
+            is_fast_option = time_mode.upper() == "TIME"
+            self.start_candles_stream(asset, duration)
+            await self.get_server_time()
+            self.api.buy(amount, asset, direction, duration, request_id, is_fast_option)
 
-        count = 0.1
-        new_op_id = None
-        while await self.check_connect():
-            current_keys = set(self.api.buy_id.keys())
-            new_keys = current_keys - initial_keys
-            if new_keys:
-                new_op_id = next(iter(new_keys))
-                status_buy = True
-                break
-            count += 0.2
-            if count > duration:
+            count = 0.1
+            new_op_id = None
+            while await self.check_connect():
+                current_keys = set(self.api.buy_id.keys())
+                new_keys = current_keys - initial_keys
+                if new_keys:
+                    new_op_id = next(iter(new_keys))
+                    status_buy = True
+                    break
+                count += 0.2
+                if count > duration:
+                    status_buy = False
+                    break
+                await asyncio.sleep(0.2)
+                if self.api.state.check_websocket_if_error:
+                    return False, self.api.state.websocket_error_reason
+            else:
                 status_buy = False
-                break
-            await asyncio.sleep(0.2)
-            if self.api.state.check_websocket_if_error:
-                return False, self.api.state.websocket_error_reason
-        else:
-            status_buy = False
 
-        return status_buy, self.api.buy_successful.get(new_op_id)
+            return status_buy, self.api.buy_successful.get(new_op_id)
 
     async def open_pending(self, amount: float, asset: str, direction: str, duration: int, open_time: str = None):
-        # Snapshot current keys to detect the new ticket from the server.
-        initial_keys = set(self.api.pending_id.keys())
-        user_settings = await self.get_profile()
-        offset_zone = user_settings.offset
-        open_time = expiration.get_next_timeframe(
-            int(time.time()),
-            offset_zone,
-            duration,
-            open_time
-        )
-        self.api.open_pending(amount, asset, direction, duration, open_time)
-        start = time.time()
-        new_ticket = None
-        while await self.check_connect():
-            current_keys = set(self.api.pending_id.keys())
-            new_keys = current_keys - initial_keys
-            if new_keys:
-                new_ticket = next(iter(new_keys))
-                status_buy = True
-                self.api.instruments_follow(amount, asset, direction, duration, open_time)
-                break
-            if time.time() - start > 30:
-                logger.error("Timeout pending order.")
-                return False, "Timeout waiting for pending ID"
-            await asyncio.sleep(0.2)
-            if self.api.state.check_websocket_if_error:
-                return False, self.api.state.websocket_error_reason
-        else:
-            status_buy = False
+        async with self._trade_lock:
+            # Snapshot current keys to detect the new ticket from the server.
+            initial_keys = set(self.api.pending_id.keys())
+            user_settings = await self.get_profile()
+            offset_zone = user_settings.offset
+            open_time = expiration.get_next_timeframe(
+                int(time.time()),
+                offset_zone,
+                duration,
+                open_time
+            )
+            self.api.open_pending(amount, asset, direction, duration, open_time)
+            start = time.time()
+            new_ticket = None
+            while await self.check_connect():
+                current_keys = set(self.api.pending_id.keys())
+                new_keys = current_keys - initial_keys
+                if new_keys:
+                    new_ticket = next(iter(new_keys))
+                    status_buy = True
+                    self.api.instruments_follow(amount, asset, direction, duration, open_time)
+                    break
+                if time.time() - start > 30:
+                    logger.error("Timeout pending order.")
+                    return False, "Timeout waiting for pending ID"
+                await asyncio.sleep(0.2)
+                if self.api.state.check_websocket_if_error:
+                    return False, self.api.state.websocket_error_reason
+            else:
+                status_buy = False
 
-        return status_buy, self.api.pending_successful.get(new_ticket)
+            return status_buy, self.api.pending_successful.get(new_ticket)
 
     async def sell_option(self, options_ids, timeout=DEFAULT_TIMEOUT):
         """Sell asset Quotex"""
@@ -689,43 +721,61 @@ class Quotex:
         return self.api.sold_options_respond
 
     def get_payment(self):
-        """Payment Quotex server"""
+        """Payment Quotex server.
+
+        Accesses instrument data by position. Guards against IndexError in
+        case the server-side schema adds or removes fields in the future.
+        """
         assets_data = {}
         for i in self.api.instruments:
-            assets_data[i[2].replace("\n", "")] = {
-                "turbo_payment": i[18],
-                "payment": i[5],
-                "profit": {
-                    "1M": i[-9],
-                    "5M": i[-8]
-                },
-                "open": i[14]
-            }
+            try:
+                name = i[2].replace("\n", "") if len(i) > 2 else str(i)
+                assets_data[name] = {
+                    "turbo_payment": i[18] if len(i) > 18 else None,
+                    "payment":       i[5]  if len(i) > 5  else None,
+                    "profit": {
+                        "1M": i[-9] if len(i) >= 9 else None,
+                        "5M": i[-8] if len(i) >= 8 else None,
+                    },
+                    "open": i[14] if len(i) > 14 else None,
+                }
+            except (IndexError, TypeError) as exc:
+                logger.warning("get_payment: skipping malformed instrument entry: %s", exc)
 
         return assets_data
 
     def get_payout_by_asset(self, asset_name: str, timeframe: str = "1"):
-        """Payout Quotex server"""
+        """Payout Quotex server.
+
+        Accesses instrument data by position. Guards against IndexError in
+        case the server-side schema adds or removes fields in the future.
+        """
         assets_data = {}
         for i in self.api.instruments:
             if asset_name == i[1]:
-                assets_data[i[1].replace("\n", "")] = {
-                    "turbo_payment": i[18],
-                    "payment": i[5],
-                    "profit": {
-                        "24H": i[-10],
-                        "1M": i[-9],
-                        "5M": i[-8]
-                    },
-                    "open": i[14]
-                }
+                try:
+                    name = i[1].replace("\n", "") if len(i) > 1 else asset_name
+                    assets_data[name] = {
+                        "turbo_payment": i[18]  if len(i) > 18 else None,
+                        "payment":       i[5]   if len(i) > 5  else None,
+                        "profit": {
+                            "24H": i[-10] if len(i) >= 10 else None,
+                            "1M":  i[-9]  if len(i) >= 9  else None,
+                            "5M":  i[-8]  if len(i) >= 8  else None,
+                        },
+                        "open": i[14] if len(i) > 14 else None,
+                    }
+                except (IndexError, TypeError) as exc:
+                    logger.warning("get_payout_by_asset: malformed entry for '%s': %s", asset_name, exc)
                 break
 
         data = assets_data.get(asset_name)
+        if not data:
+            return None
         if timeframe == "all":
             return data.get("profit")
 
-        return data.get("profit").get(f"{timeframe}M")
+        return data.get("profit", {}).get(f"{timeframe}M")
 
     async def start_remaing_time(self):
         now_stamp = datetime.fromtimestamp(expiration.get_timestamp())
@@ -741,6 +791,7 @@ class Quotex:
         task = asyncio.create_task(
             self.start_remaing_time()
         )
+        data_dict = None
         start = time.time()
         while await self.check_connect():
             if time.time() - start > 86400: # Max wait 1 day safety cap
@@ -751,6 +802,8 @@ class Quotex:
             await asyncio.sleep(0.2)
         task.cancel()
         self.api.listinfodata.delete(id_number)
+        if data_dict is None or "win" not in data_dict:
+            return None
         return data_dict["win"]
 
     def start_candles_stream(self, asset: str = "EURUSD", period: int = 0):
@@ -838,34 +891,52 @@ class Quotex:
     async def start_realtime_price(self, asset: str, period: int = 0, timeout: int = DEFAULT_TIMEOUT):
         self.start_candles_stream(asset, period)
         start = time.time()
-        while True:
-            if self.api.realtime_price.get(asset):
-                return self.api.realtime_price
-            if time.time() - start > timeout:
-                raise TimeoutError(f"Timeout waiting for realtime price data for {asset}.")
-            await asyncio.sleep(0.2)
+        try:
+            while True:
+                if self.api.realtime_price.get(asset):
+                    return self.api.realtime_price.get(asset)
+                if time.time() - start > timeout:
+                    raise TimeoutError(f"Timeout waiting for realtime price data for {asset}.")
+                await asyncio.sleep(0.2)
+        finally:
+            try:
+                self.stop_candles_stream(asset)
+            except Exception:
+                pass
 
     async def start_realtime_sentiment(self, asset: str, period: int = 0, timeout: int = DEFAULT_TIMEOUT):
         self.start_candles_stream(asset, period)
         start = time.time()
-        while True:
-            if self.api.realtime_sentiment.get(asset):
-                return self.api.realtime_sentiment[asset]
-            if time.time() - start > timeout:
-                raise TimeoutError(f"Timeout waiting for realtime sentiment data for {asset}.")
-            await asyncio.sleep(0.2)
+        try:
+            while True:
+                if self.api.realtime_sentiment.get(asset):
+                    return self.api.realtime_sentiment[asset]
+                if time.time() - start > timeout:
+                    raise TimeoutError(f"Timeout waiting for realtime sentiment data for {asset}.")
+                await asyncio.sleep(0.2)
+        finally:
+            try:
+                self.stop_candles_stream(asset)
+            except Exception:
+                pass
 
     async def start_realtime_candle(self, asset: str, period: int = 0, timeout: int = DEFAULT_TIMEOUT):
         self.start_candles_stream(asset, period)
         data = {}
         start = time.time()
-        while True:
-            if self.api.realtime_candles.get(asset):
-                tick = self.api.realtime_candles
-                return process_tick(tick, period, data)
-            if time.time() - start > timeout:
-                raise TimeoutError(f"Timeout waiting for realtime candle data for {asset}.")
-            await asyncio.sleep(0.2)
+        try:
+            while True:
+                if self.api.realtime_candles.get(asset):
+                    tick = self.api.realtime_candles
+                    return process_tick(tick, period, data)
+                if time.time() - start > timeout:
+                    raise TimeoutError(f"Timeout waiting for realtime candle data for {asset}.")
+                await asyncio.sleep(0.2)
+        finally:
+            try:
+                self.stop_candles_stream(asset)
+            except Exception:
+                pass
 
     async def get_realtime_candles(self, asset: str):
         """Retrieve real-time candle data for a specified asset.
@@ -938,7 +1009,6 @@ class Quotex:
                 self.api.follow_candle(self.codes_asset[asset])
             except Exception as e:
                 logger.error('**error** start_candles_stream reconnect: %s', e)
-                await self.connect()
             await asyncio.sleep(0.2)
 
     async def start_candles_all_size_stream(self, asset):
@@ -958,9 +1028,7 @@ class Quotex:
             try:
                 self.api.subscribe_all_size(self.codes_asset[asset])
             except Exception as e:
-                logger.error(
-                    '**error** start_candles_all_size_stream reconnect: %s', e)
-                await self.connect()
+                logger.error('**error** start_candles_all_size_stream reconnect: %s', e)
             await asyncio.sleep(0.2)
 
     async def start_mood_stream(self, asset, instrument="turbo-option"):

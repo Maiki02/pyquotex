@@ -121,7 +121,7 @@ class WebsocketClient:
                         for get_m in message["deals"]:
                             deal_id = get_m.get("id")
                             self.api.profit_in_operation[deal_id] = get_m["profit"]
-                            get_m["win"] = True if message["profit"] > 0 else False
+                            get_m["win"] = True if get_m["profit"] > 0 else False
                             get_m["game_state"] = 1
                             self.api.listinfodata.set(
                                 get_m["win"],
@@ -171,6 +171,8 @@ class WebsocketClient:
                 asset_name = message[0][0]
                 if asset_name in self.api.realtime_price:
                     self.api.realtime_price[asset_name].append(result)
+                    if len(self.api.realtime_price[asset_name]) > 1000:
+                        self.api.realtime_price[asset_name].pop(0)
                 self.api.realtime_candles[asset_name] = message[0]
             elif isinstance(message, list) and len(message) > 0 and isinstance(message[0], list) and len(message[0]) == 2:
                 for i in message:
