@@ -176,11 +176,12 @@ class Quotex:
         if end_from_time is None:
             end_from_time = time.time()
         index = expiration.get_timestamp()
-        self.api.candles.candles_data = None
+        # Clear only this asset's entry — not the entire candles object.
+        self.api.candles.clear(asset)
         self.start_candles_stream(asset, period)
         self.api.get_candles(asset, index, end_from_time, offset, period)
         start_time = time.time()
-        while await self.check_connect() and self.api.candles.candles_data is None:
+        while await self.check_connect() and self.api.candles.get(asset) is None:
             if time.time() - start_time > timeout:
                 logger.error(f"Timeout waiting for get_candles data for {asset}.")
                 return None
@@ -189,7 +190,7 @@ class Quotex:
         candles = self.prepare_candles(asset, period)
 
         if progressive:
-            return self.api.historical_candles.get("data", {})
+            return self.api.historical_candles.get(asset, {})
 
         return candles
 
@@ -197,23 +198,18 @@ class Quotex:
         if end_from_time is None:
             end_from_time = time.time()
         index = expiration.get_timestamp()
-        self.api.current_asset = asset
-        self.api.historical_candles = None
+        # Reset only this asset's entry — never the whole dict.
+        self.api.historical_candles[asset] = None
         self.start_candles_stream(asset)
-        self.api.get_history_line(self.codes_asset[asset], index, end_from_time, offset)
+        # Pass asset= so api.get_history_line registers the Correlation ID.
+        self.api.get_history_line(self.codes_asset[asset], index, end_from_time, offset, asset=asset)
         start_time = time.time()
-        while True:
-            while await self.check_connect() and self.api.historical_candles is None:
-                if time.time() - start_time > timeout:
-                    logger.error(f"Timeout waiting for get_history_line data for {asset}.")
-                    return None
-                await asyncio.sleep(0.2)
-            if self.api.historical_candles is not None:
-                break
+        while await self.check_connect() and self.api.historical_candles.get(asset) is None:
             if time.time() - start_time > timeout:
                 logger.error(f"Timeout waiting for get_history_line data for {asset}.")
                 return None
-        return self.api.historical_candles
+            await asyncio.sleep(0.2)
+        return self.api.historical_candles.get(asset)
 
     async def get_candle_v2(self, asset, period, timeout=DEFAULT_TIMEOUT):
         self.api.candle_v2_data[asset] = None
@@ -238,7 +234,8 @@ class Quotex:
         Returns:
             list: List of prepared candles data.
         """
-        candles_data = calculate_candles(self.api.candles.candles_data, period)
+        # Use per-asset get() — never candles.candles_data (whole dict).
+        candles_data = calculate_candles(self.api.candles.get(asset), period)
         candles_v2_data = process_candles_v2(self.api.candle_v2_data, asset, candles_data)
         new_candles = merge_candles(candles_v2_data)
 
@@ -258,8 +255,6 @@ class Quotex:
         await self.close()
         self.api.trace_ws = self.debug_ws_enable
         self.api.session_data = self.session_data
-        self.api.current_asset = self.asset_default
-        self.api.current_period = self.period_default
         self.api.state.SSID = self.session_data.get("token")
 
         if not self.session_data.get("token"):
@@ -618,7 +613,10 @@ class Quotex:
             The buy result.
 
         """
-        self.api.buy_id = None
+        # Snapshot current keys so we can detect the new operation ID
+        # returned by the server, even when multiple buy() calls run
+        # concurrently (they each see a different initial_keys set).
+        initial_keys = set(self.api.buy_id.keys())
         request_id = expiration.get_timestamp()
         is_fast_option = time_mode.upper() == "TIME"
         self.start_candles_stream(asset, duration)
@@ -626,7 +624,14 @@ class Quotex:
         self.api.buy(amount, asset, direction, duration, request_id, is_fast_option)
 
         count = 0.1
-        while await self.check_connect() and self.api.buy_id is None:
+        new_op_id = None
+        while await self.check_connect():
+            current_keys = set(self.api.buy_id.keys())
+            new_keys = current_keys - initial_keys
+            if new_keys:
+                new_op_id = next(iter(new_keys))
+                status_buy = True
+                break
             count += 0.2
             if count > duration:
                 status_buy = False
@@ -635,12 +640,13 @@ class Quotex:
             if self.api.state.check_websocket_if_error:
                 return False, self.api.state.websocket_error_reason
         else:
-            status_buy = True
+            status_buy = False
 
-        return status_buy, self.api.buy_successful
+        return status_buy, self.api.buy_successful.get(new_op_id)
 
     async def open_pending(self, amount: float, asset: str, direction: str, duration: int, open_time: str = None):
-        self.api.pending_id = None
+        # Snapshot current keys to detect the new ticket from the server.
+        initial_keys = set(self.api.pending_id.keys())
         user_settings = await self.get_profile()
         offset_zone = user_settings.offset
         open_time = expiration.get_next_timeframe(
@@ -651,7 +657,15 @@ class Quotex:
         )
         self.api.open_pending(amount, asset, direction, duration, open_time)
         start = time.time()
-        while await self.check_connect() and self.api.pending_id is None:
+        new_ticket = None
+        while await self.check_connect():
+            current_keys = set(self.api.pending_id.keys())
+            new_keys = current_keys - initial_keys
+            if new_keys:
+                new_ticket = next(iter(new_keys))
+                status_buy = True
+                self.api.instruments_follow(amount, asset, direction, duration, open_time)
+                break
             if time.time() - start > 30:
                 logger.error("Timeout pending order.")
                 return False, "Timeout waiting for pending ID"
@@ -659,10 +673,9 @@ class Quotex:
             if self.api.state.check_websocket_if_error:
                 return False, self.api.state.websocket_error_reason
         else:
-            status_buy = True
-            self.api.instruments_follow(amount, asset, direction, duration, open_time)
+            status_buy = False
 
-        return status_buy, self.api.pending_successful
+        return status_buy, self.api.pending_successful.get(new_ticket)
 
     async def sell_option(self, options_ids, timeout=DEFAULT_TIMEOUT):
         """Sell asset Quotex"""
@@ -747,7 +760,8 @@ class Quotex:
             asset (str): The asset to stream data for.
             period (int, optional): The period for the candles. Defaults to 0.
         """
-        self.api.current_asset = asset
+        # Do NOT assign self.api.current_asset here. The stream subscription
+        # is per-asset and must not mutate any global routing variable.
         self.api.subscribe_realtime_candle(asset, period)
         self.api.chart_notification(asset)
         self.api.follow_candle(asset)
@@ -781,7 +795,6 @@ class Quotex:
             TimeoutError: If the investment settings cannot be retrieved within timeout.
         """
         is_fast_option = False if time_mode.upper() == "TIMER" else True
-        self.api.current_asset = asset
         self.api.settings_apply(
             asset,
             period,
@@ -874,8 +887,19 @@ class Quotex:
     def get_signal_data(self):
         return self.api.signal_data
 
-    def get_profit(self):
-        return self.api.profit_in_operation or 0
+    def get_profit(self, deal_id=None):
+        """Return profit for a specific deal or the sum of all recorded profits.
+
+        Args:
+            deal_id: When provided, return only the profit for that deal.
+                     When None (default), return the sum of all profits
+                     recorded in the current session (legacy behaviour).
+        """
+        if deal_id is not None:
+            return self.api.profit_in_operation.get(deal_id, 0)
+        if not self.api.profit_in_operation:
+            return 0
+        return sum(v for v in self.api.profit_in_operation.values() if v is not None)
 
     async def get_result(self, operation_id: str):
         """Check if the trade is a win based on its ID.

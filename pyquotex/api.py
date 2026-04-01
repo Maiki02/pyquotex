@@ -68,31 +68,67 @@ class QuotexAPI:
         :param proxies: The proxies of a Quotex server.
         :param user_data_dir: The path browser user data dir.
         """
-        # -- per-instance connection state (replaces global_value) --
+        # ------------------------------------------------------------------
+        # Per-connection state
+        # ------------------------------------------------------------------
         self.state = ConnectionState()
 
-        # -- per-instance mutable attributes (were class-level before) --
+        # ------------------------------------------------------------------
+        # Concurrent multi-asset state — each dict is keyed by asset name.
+        # NEVER use current_asset as a routing key for these structures.
+        # ------------------------------------------------------------------
+        self.historical_candles = {}        # {asset: history_payload}
+        self.realtime_price = {}            # {asset: [price_tick_dicts]}
+        self.realtime_price_data = []
+        self.realtime_candles = {}          # {asset: candle_raw_list}
+        self.realtime_sentiment = {}        # {asset: sentiment_dict}
+        self.candle_v2_data = {}            # {asset: candle_v2_payload}
+        self.signal_data = {}
+        self.get_candle_data = {}
+        self.top_list_leader = {}
+        self.settings_list = {}
+
+        # Correlation ID map: maps request index -> asset name so that
+        # history/load/line responses (which lack asset in the payload)
+        # can be routed to the correct key in historical_candles.
+        self._pending_history_requests = {}  # {index: asset}
+
+        # ------------------------------------------------------------------
+        # Per-operation state — keyed by server-returned ID/ticket so that
+        # concurrent buy/pending calls do not overwrite each other.
+        # ------------------------------------------------------------------
+        self.buy_id = {}              # {operation_id: operation_id}
+        self.buy_successful = {}      # {operation_id: server_payload}
+        self.pending_id = {}          # {ticket: ticket}
+        self.pending_successful = {}  # {ticket: server_payload}
+        self.profit_in_operation = {} # {deal_id: profit_float}
+
+        # ------------------------------------------------------------------
+        # Scalar operational state (not used for concurrent routing)
+        # ------------------------------------------------------------------
         self.socket_option_opened = {}
-        self.buy_id = None
-        self.pending_id = None
         self.trace_ws = False
         self.buy_expiration = None
-        self.current_asset = None
+        self.current_asset = None   # informational only; NOT a routing key
         self.current_period = None
-        self.buy_successful = None
-        self.pending_successful = None
         self.account_balance = None
         self.account_type = None
         self.instruments = None
         self.training_balance_edit_request = None
-        self.profit_in_operation = None
         self.sold_options_respond = None
         self.sold_digital_options_respond = None
+
+        # ------------------------------------------------------------------
+        # Composite objects
+        # ------------------------------------------------------------------
         self.listinfodata = ListInfoData()
         self.timesync = TimeSync()
-        self.candles = Candles()
+        self.candles = Candles()     # now stores data per-asset internally
         self.profile = Profile()
 
+        # ------------------------------------------------------------------
+        # Connection config
+        # ------------------------------------------------------------------
         self.host = host
         self.https_url = f"https://{host}"
         self.wss_url = f"wss://ws2.{host}/socket.io/?EIO=3&transport=websocket"
@@ -110,40 +146,6 @@ class QuotexAPI:
         self.user_data_dir = user_data_dir
         self.proxies = proxies
         self.lang = lang
-        self.state = global_value.create_connection_state()
-
-        # Mutable state must be instance-scoped to avoid data bleeding across clients.
-        self.socket_option_opened = {}
-        self.buy_id = None
-        self.pending_id = None
-        self.trace_ws = False
-        self.buy_expiration = None
-        self.current_asset = None
-        self.current_period = None
-        self.buy_successful = None
-        self.pending_successful = None
-        self.account_balance = None
-        self.account_type = None
-        self.instruments = None
-        self.training_balance_edit_request = None
-        self.profit_in_operation = None
-        self.sold_options_respond = None
-        self.sold_digital_options_respond = None
-        self.listinfodata = ListInfoData()
-        self.timesync = TimeSync()
-        self.candles = Candles()
-        self.profile = Profile()
-
-        self.settings_list = {}
-        self.signal_data = {}
-        self.get_candle_data = {}
-        self.historical_candles = {}
-        self.candle_v2_data = {}
-        self.realtime_price = {}
-        self.realtime_price_data = []
-        self.realtime_candles = {}
-        self.realtime_sentiment = {}
-        self.top_list_leader = {}
         self.session_data = {}
         self.browser = Browser()
         self.browser.set_headers()
@@ -243,7 +245,22 @@ class QuotexAPI:
         data = f'42["account/change",{json.dumps(payload)}]'
         self.send_websocket_request(data)
 
-    def get_history_line(self, asset_id, index, end_from_time, offset):
+    def get_history_line(self, asset_id, index, end_from_time, offset, asset=None):
+        """Request historical line data for an asset.
+
+        :param asset_id: The numeric ID of the asset.
+        :param index: Unique timestamp index for this request (used as
+            correlation key to route the server response back to the
+            correct asset in historical_candles).
+        :param end_from_time: End timestamp of the requested window.
+        :param offset: Time window size in seconds.
+        :param asset: The human-readable asset name (e.g. "EURUSD").
+            When provided, registers the correlation mapping so that
+            on_message can route the response without relying on
+            current_asset.
+        """
+        if asset is not None:
+            self._pending_history_requests[index] = asset
         payload = {
             "id": asset_id,
             "index": index,

@@ -90,28 +90,43 @@ class WebsocketClient:
                     elif len(message) == 1 and message.get("profit", -1) > -1:
                         self.api.profit_today = message
                     elif message.get("index"):
-                        self.api.historical_candles = message
+                        # Correlation ID pattern: resolve which asset this
+                        # response belongs to via _pending_history_requests.
+                        idx = message.get("index")
+                        asset = self.api._pending_history_requests.pop(idx, None)
+                        if asset is not None:
+                            self.api.historical_candles[asset] = message
+                        else:
+                            logger.warning(
+                                "history/load/line response with unknown index %s — "
+                                "response dropped to avoid routing to wrong asset.", idx
+                            )
                         if message.get("closeTimestamp"):
                             self.api.timesync.server_timestamp = message.get("closeTimestamp")
                     if message.get("pending"):
-                        self.api.pending_successful = message
-                        self.api.pending_id = message["pending"]["ticket"]
+                        # Index by ticket so concurrent open_pending calls stay isolated.
+                        ticket = message["pending"]["ticket"]
+                        self.api.pending_successful[ticket] = message
+                        self.api.pending_id[ticket] = ticket
                     elif message.get("id") and not message.get("ticket"):
-                        self.api.buy_successful = message
-                        self.api.buy_id = message["id"]
+                        # Index by operation_id so concurrent buy calls stay isolated.
+                        op_id = message["id"]
+                        self.api.buy_successful[op_id] = message
+                        self.api.buy_id[op_id] = op_id
                         if message.get("closeTimestamp"):
                             self.api.timesync.server_timestamp = message.get("closeTimestamp")
                     elif message.get("ticket") and not message.get("id"):
                         self.api.sold_options_respond = message
                     elif message.get("deals"):
                         for get_m in message["deals"]:
-                            self.api.profit_in_operation = get_m["profit"]
+                            deal_id = get_m.get("id")
+                            self.api.profit_in_operation[deal_id] = get_m["profit"]
                             get_m["win"] = True if message["profit"] > 0 else False
                             get_m["game_state"] = 1
                             self.api.listinfodata.set(
                                 get_m["win"],
                                 get_m["game_state"],
-                                get_m["id"]
+                                deal_id
                             )
                     elif message.get("isDemo") and message.get("balance"):
                         self.api.training_balance_edit_request = message
@@ -133,8 +148,9 @@ class WebsocketClient:
             elif self.api._temp_status == """451-["history/list/v2",{"_placeholder":true,"num":0}]""":
                 message_asset = message.get("asset")
                 if message_asset:
-                    self.api.current_asset = message_asset
-                    self.api.candles.candles_data = message["history"]
+                    # Route by asset from payload — never use current_asset
+                    # here, as multiple concurrent requests would collide.
+                    self.api.candles.set(message_asset, message.get("history"))
                     self.api.candle_v2_data[message_asset] = message
                     self.api.candle_v2_data[message_asset]["candles"] = [{
                         "time": candle[0],
@@ -144,13 +160,18 @@ class WebsocketClient:
                         "low": candle[4],
                         "ticks": candle[5]
                     } for candle in message["candles"]]
+                self.api._temp_status = ""
             elif isinstance(message, list) and len(message) > 0 and isinstance(message[0], list) and len(message[0]) == 4:
                 result = {
                     "time": message[0][1],
                     "price": message[0][2]
                 }
-                self.api.realtime_price[message[0][0]].append(result)
-                self.api.realtime_candles[self.api.current_asset] = message[0]
+                # Asset name is position [0][0] in the payload — use it
+                # directly instead of the global current_asset.
+                asset_name = message[0][0]
+                if asset_name in self.api.realtime_price:
+                    self.api.realtime_price[asset_name].append(result)
+                self.api.realtime_candles[asset_name] = message[0]
             elif isinstance(message, list) and len(message) > 0 and isinstance(message[0], list) and len(message[0]) == 2:
                 for i in message:
                     result = {
@@ -171,17 +192,21 @@ class WebsocketClient:
         self.state.check_websocket_if_error = True
 
     def on_open(self, wss):
-        """Method to process websocket open."""
+        """Method to process websocket open.
+
+        No asset-specific subscriptions are sent here. Restoring all active
+        instrument subscriptions after a (re)connect is the exclusive
+        responsibility of stable_api.re_subscribe_stream(), which holds
+        the full authoritative list (subscribe_candle, subscribe_candle_all_size,
+        subscribe_mood) and can correctly restore *all* instruments — not just
+        a single global default asset.
+        """
         logger.info("Websocket client connected.")
         self.state.check_websocket_if_connect = 1
-        asset_name = self.api.current_asset
-        period = self.api.current_period
         self.wss.send('42["tick"]')
         self.wss.send('42["indicator/list"]')
         self.wss.send('42["drawing/load"]')
         self.wss.send('42["pending/list"]')
-        self.wss.send('42["instruments/update",{"asset":"%s","period":%d}]' % (asset_name, period))
-        self.wss.send('42["depth/follow","%s"]' % asset_name)
         self.wss.send('42["chart_notification/get"]')
         self.wss.send('42["tick"]')
 
