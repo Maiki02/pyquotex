@@ -122,6 +122,26 @@ Boas práticas:
 - Não reutilizar o mesmo objeto para múltiplos logins concorrentes.
 - Fechar cada sessão com `await client.close()`.
 
+## 📝 Recent Changes / Cambios Recientes / Mudanças Recentes (April 2026)
+
+### 🇺🇸 English
+- `connect()` now includes an auth fallback: if WebSocket rejects the session token, pyquotex clears in-memory session data, runs `authenticate()` with credentials, and retries WebSocket connection.
+- `get_candles()` now triggers a minimal subscription (`subscribe_realtime_candle`) to force historical payload delivery when required by the broker.
+- In snapshot mode (`progressive=False`), subscription teardown is guaranteed in `finally` via `unsubscribe_realtime_candle`, avoiding bandwidth leaks.
+- Connection and data routing remain isolated per client/asset for safer concurrent usage.
+
+### 🇪🇸 Español
+- `connect()` incluye fallback de autenticación: si WebSocket rechaza el token de sesión, pyquotex limpia la sesión en memoria, ejecuta `authenticate()` y reintenta la conexión.
+- `get_candles()` dispara una suscripción mínima (`subscribe_realtime_candle`) para forzar entrega de histórico cuando el broker lo exige.
+- En modo snapshot (`progressive=False`), el cierre de suscripción queda garantizado en `finally` con `unsubscribe_realtime_candle`, evitando fuga de red.
+- El estado y ruteo de datos se mantienen aislados por cliente/activo para uso concurrente seguro.
+
+### 🇧🇷 Português
+- `connect()` possui fallback de autenticação: se o WebSocket rejeitar o token de sessão, o pyquotex limpa a sessão em memória, executa `authenticate()` e tenta conectar novamente.
+- `get_candles()` dispara assinatura mínima (`subscribe_realtime_candle`) para forçar entrega do histórico quando o broker exige.
+- No modo snapshot (`progressive=False`), o encerramento da assinatura é garantido em `finally` com `unsubscribe_realtime_candle`, evitando vazamento de rede.
+- Estado e roteamento de dados permanecem isolados por cliente/ativo para concorrência segura.
+
 ---
 
 ## 💡 Recursos Principais

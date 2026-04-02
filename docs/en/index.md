@@ -20,6 +20,7 @@ Welcome to the pyquotex documentation!
 - [Basic Examples](9.%20Basic%20Examples)
 - [Technical Aspects](10.%20Technical%20Aspects)
 - [Considerations and Warnings](11.%20Considerations%20and%20Warnings)
+- [Recent Changes](12.%20Recent%20Changes)
 
 ---
 
